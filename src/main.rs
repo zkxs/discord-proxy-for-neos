@@ -12,11 +12,14 @@ use tokio::sync::{RwLock, Semaphore};
 use warp::Filter;
 use warp::http::{Response, StatusCode};
 
-use crate::user::User;
+use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
 
-mod user;
+use crate::dto::{User, ExtraUserIds};
+
+mod dto;
 
 const DISCORD_USER_URI: &str = "https://discord.com/api/v9/users/";
+const NQUERY_URI: &str = "http://127.0.0.1:3029/ExtraUserIds?m=";
 const DEFAULT_CONFIG_FILE_NAME: &str = "discord_token.config";
 const CACHE_EXPIRY_DURATION: Duration = Duration::from_secs(60 * 60); // 1 hour
 
@@ -67,13 +70,19 @@ async fn main() {
         .and(warp::get())
         .map(|| format!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")));
 
-    let discord_user = warp::path!("users" / String)
+    let discord_user_by_snowflake = warp::path!("users" / String)
         .and(warp::get())
-        .and(with_state(user_state))
+        .and(with_state(user_state.clone()))
         .and_then(discord_user_handler);
 
+    let discord_user_by_machine_id = warp::path!("machineid" / String)
+        .and(warp::get())
+        .and(with_state(user_state))
+        .and_then(neos_machine_id_handler);
+
     let routes = info
-        .or(discord_user);
+        .or(discord_user_by_snowflake)
+        .or(discord_user_by_machine_id);
 
     println!("Starting web server...");
     warp::serve(routes)
@@ -95,7 +104,36 @@ fn with_state<T: Clone + Send>(db: T) -> impl Filter<Extract=(T, ), Error=std::c
     warp::any().map(move || db.clone())
 }
 
+async fn neos_machine_id_handler(machine_id: String, state: UserStateContainer) -> Result<impl warp::Reply, warp::Rejection> {
+
+    match extra_user_id_lookup(machine_id).await {
+        Ok(extra_user_ids) => {
+            match extra_user_ids.discord {
+                Some(discord_id) => {
+                    match discord_cached_lookup(discord_id, &state).await {
+                        Ok(user) => Ok(Response::builder().status(StatusCode::OK).body(user)),
+                        Err(e) => Ok(Response::builder().status(StatusCode::NOT_FOUND).body(e)),
+                    }
+                }
+                None => {
+                    Ok(Response::builder().status(StatusCode::NOT_FOUND).body("N/A".to_string()))
+                }
+            }
+        }
+        Err(e) => {
+            Ok(Response::builder().status(StatusCode::NOT_FOUND).body(e))
+        }
+    }
+}
+
 async fn discord_user_handler(user_id: String, state: UserStateContainer) -> Result<impl warp::Reply, warp::Rejection> {
+    match discord_cached_lookup(user_id, &state).await {
+        Ok(user) => Ok(Response::builder().status(StatusCode::OK).body(user)),
+        Err(e) => Ok(Response::builder().status(StatusCode::NOT_FOUND).body(e)),
+    }
+}
+
+async fn discord_cached_lookup(user_id: String, state: &UserStateContainer) -> Result<String, String> {
     let mutable_state_mutex = state.mutable_state.read().await;
 
     let cache_result = match (*mutable_state_mutex).cache.get(&user_id) {
@@ -111,83 +149,102 @@ async fn discord_user_handler(user_id: String, state: UserStateContainer) -> Res
     };
 
     if let Some(user_string) = cache_result {
-        Ok(Response::builder().status(StatusCode::OK).body(user_string.user_string.to_string()))
+        Ok(user_string.user_string.to_owned())
     } else {
         (*mutable_state_mutex).semaphore.acquire().await.expect("semaphore error").forget();
         drop(mutable_state_mutex);
 
-        let request = Request::get(DISCORD_USER_URI.to_owned() + &user_id)
-            .header("Authorization", "Bot ".to_string() + &state.discord_bot_token)
-            .body(hyper::Body::default());
-        let request = match request {
-            Ok(request) => request,
-            Err(e) => {
-                restore_permit(&state).await;
-                return Ok(Response::builder().status(StatusCode::BAD_REQUEST).body(format!("Error building request: {:?}", e)));
-            }
-        };
+        discord_lookup(user_id, state).await
+    }
+}
 
-        let https = HttpsConnector::new();
-        let client = Client::builder().build::<_, hyper::Body>(https);
+async fn discord_lookup(user_id: String, state: &UserStateContainer) -> Result<String, String> {
+    let request = Request::get(DISCORD_USER_URI.to_owned() + &user_id)
+        .header("Authorization", "Bot ".to_string() + &state.discord_bot_token)
+        .body(hyper::Body::default());
+    let request = match request {
+        Ok(request) => request,
+        Err(e) => {
+            restore_permit(state).await;
+            return Err(format!("Error building request: {:?}", e));
+        }
+    };
 
-        match client.request(request).await {
-            Ok(response) => {
-                if &response.status() == &StatusCode::OK {
-                    let delay = response.headers().get("x-ratelimit-reset-after")
-                        .and_then(|d| String::from_utf8(d.as_bytes().into()).ok())
-                        .and_then(|d| d.parse().ok())
-                        .unwrap_or(30.0);
+    let https = HttpsConnector::new();
+    let client = Client::builder().build::<_, hyper::Body>(https);
 
-                    println!("permit will return after {}s", delay);
+    match client.request(request).await {
+        Ok(response) => {
+            if &response.status() == &StatusCode::OK {
+                let delay = response.headers().get("x-ratelimit-reset-after")
+                    .and_then(|d| String::from_utf8(d.as_bytes().into()).ok())
+                    .and_then(|d| d.parse().ok())
+                    .unwrap_or(30.0);
 
-                    // schedule permit restoration
-                    let state_clone = state.clone();
-                    tokio::spawn(async move {
-                        tokio::time::sleep(Duration::from_secs_f64(delay)).await;
-                        restore_permit(&state_clone).await;
-                    });
+                println!("permit will return after {}s", delay);
 
-                    match deserialize_user(response).await {
-                        Ok(user) => {
-                            let user_string = user.into_pretty_string();
-                            let mut mutable_state_mutex = state.mutable_state.write().await;
-                            (*mutable_state_mutex).cache.insert(user_id, CachedUser {
-                                user_string: user_string.clone(),
-                                cache_time: Instant::now(),
-                            });
-                            println!("Cached new user: {}", user_string);
-                            Ok(Response::builder().status(StatusCode::OK).body(user_string))
-                        }
-                        Err(e) => {
-                            let text = format!("Error deserializing 200 response: {}", e);
-                            Ok(Response::builder().status(StatusCode::OK).body(text))
-                        }
+                // schedule permit restoration
+                let state_clone = state.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs_f64(delay)).await;
+                    restore_permit(&state_clone).await;
+                });
+
+                match deserialize_user(response).await {
+                    Ok(user) => {
+                        let user_string = user.as_pretty_string();
+                        let mut mutable_state_mutex = state.mutable_state.write().await;
+                        (*mutable_state_mutex).cache.insert(user_id, CachedUser {
+                            user_string: user_string.clone(),
+                            cache_time: Instant::now(),
+                        });
+                        println!("Cached new user: {}", user_string);
+                        Ok(user_string)
                     }
-                } else {
-                    // don't even worry about header parsing
-                    let state_clone = state.clone();
-                    tokio::spawn(async move {
-                        tokio::time::sleep(Duration::from_secs(30)).await;
-                        restore_permit(&state_clone).await;
-                    });
+                    Err(e) => {
+                        Err(format!("Error deserializing 200 response: {}", e))
+                    }
+                }
+            } else {
+                // don't even worry about header parsing
+                let state_clone = state.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    restore_permit(&state_clone).await;
+                });
 
-                    let status = response.status().clone();
+                let status = response.status().clone();
 
-                    match deserialize_string(response).await {
-                        Ok(error_body) => Ok(Response::builder().status(status).body(error_body)),
-                        Err(error) => {
-                            let text = format!("Error reading {} response: {}", status.as_str(), error);
-                            Ok(Response::builder().status(StatusCode::INTERNAL_SERVER_ERROR).body(text))
-                        }
+                match deserialize_string(response).await {
+                    Ok(error_body) => Err(error_body),
+                    Err(error) => {
+                        Err(format!("Error reading {} response: {}", status.as_str(), error))
                     }
                 }
             }
-            Err(e) => {
-                restore_permit(&state).await;
-                Ok(Response::builder().status(StatusCode::INTERNAL_SERVER_ERROR).body(format!("Error building performing request: {:?}", e)))
-            }
+        }
+        Err(e) => {
+            restore_permit(&state).await;
+            Err(format!("Error performing request: {:?}", e))
         }
     }
+}
+
+async fn extra_user_id_lookup(machine_id: String) -> Result<ExtraUserIds, String> {
+    let encoded_machine_id = utf8_percent_encode(&machine_id, NON_ALPHANUMERIC).to_string();
+    let uri = (NQUERY_URI.to_owned() + &encoded_machine_id).parse()
+        .map_err(|e| format!("invalid URI: {:?}", e))?;
+    let client = Client::new();
+    let response = client.get(uri).await
+        .map_err(|e| format!("Error hitting ExtraUserIds endpoint: {:?}", e))?;
+    deserialize_extra_user_ids(response).await
+}
+
+async fn deserialize_extra_user_ids(response: Response<hyper::Body>) -> Result<ExtraUserIds, String> {
+    let body = hyper::body::aggregate(response).await
+        .map_err(|e| format!("error aggregating ExtraUserIds response body: {:?}", e))?;
+    serde_json::from_reader(body.reader())
+        .map_err(|e| format!("error parsing ExtraUserIds response body: {:?}", e))
 }
 
 async fn deserialize_user(response: Response<hyper::Body>) -> Result<User, String> {

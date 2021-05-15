@@ -97,11 +97,12 @@ dependencies = [
 
 [[package]]
 name = "discord-proxy-for-neos"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "hyper",
  "hyper-tls",
+ "percent-encoding",
  "serde",
  "serde_json",
  "tokio",
