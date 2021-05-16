@@ -14,7 +14,8 @@ use warp::http::{Response, StatusCode};
 
 use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
 
-use crate::dto::{User, ExtraUserIds};
+use crate::dto::{User, ExtraUserIds, Entry};
+use std::io::BufReader;
 
 mod dto;
 
@@ -22,11 +23,13 @@ const DISCORD_USER_URI: &str = "https://discord.com/api/v9/users/";
 const NQUERY_URI: &str = "http://127.0.0.1:3029/ExtraUserIds?m=";
 const DEFAULT_CONFIG_FILE_NAME: &str = "discord_token.config";
 const CACHE_EXPIRY_DURATION: Duration = Duration::from_secs(60 * 60); // 1 hour
+const RAINBOW_TABLE: &str = "F:\\git\\discord-gateway-scraper\\snowhash.dat";
 
 type UserStateContainer = Arc<UserState>;
 
 struct UserState {
     discord_bot_token: String,
+    rainbow_table: HashMap<Vec<u8>, u64>,
     mutable_state: RwLock<MutableUserState>,
 }
 
@@ -44,8 +47,14 @@ struct CachedUser {
 async fn main() {
     println!("Initializing {} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
 
-    let proxy_server_address: SocketAddr = ([127, 0, 0, 1], 3032).into();
+    let rainbow_table_file = fs::File::open(RAINBOW_TABLE).expect("unable to open rainbow table");
+    let rainbow_table_reader = BufReader::new(rainbow_table_file);
+    let rainbow_table_entries: Vec<Entry> = bincode::deserialize_from(rainbow_table_reader).expect("unable to deserialize rainbow table");
+    let rainbow_table: HashMap<Vec<u8>, u64> = rainbow_table_entries.into_iter()
+        .map(|entry| (entry.hash, entry.snowflake))
+        .collect();
 
+    let proxy_server_address: SocketAddr = ([127, 0, 0, 1], 3032).into();
 
     let discord_bot_token = get_default_config_path()
         .and_then(|path|
@@ -60,6 +69,7 @@ async fn main() {
 
     let user_state = Arc::new(UserState {
         discord_bot_token,
+        rainbow_table,
         mutable_state: RwLock::new(MutableUserState {
             cache: Default::default(),
             semaphore: Semaphore::new(30),
@@ -108,14 +118,20 @@ async fn neos_machine_id_handler(machine_id: String, state: UserStateContainer) 
 
     match extra_user_id_lookup(machine_id).await {
         Ok(extra_user_ids) => {
-            match extra_user_ids.discord {
-                Some(discord_id) => {
+            match extra_user_ids {
+                ExtraUserIds {discord: Some(discord_id), ..} => {
                     match discord_cached_lookup(discord_id, &state).await {
                         Ok(user) => Ok(Response::builder().status(StatusCode::OK).body(user)),
                         Err(e) => Ok(Response::builder().status(StatusCode::NOT_FOUND).body(e)),
                     }
                 }
-                None => {
+                ExtraUserIds {discord_hash: Some(discord_hash), ..} => {
+                    match discord_hash_lookup(discord_hash, &state).await {
+                        Ok(user) => Ok(Response::builder().status(StatusCode::OK).body(user)),
+                        Err(e) => Ok(Response::builder().status(StatusCode::NOT_FOUND).body(e)),
+                    }
+                }
+                _ => {
                     Ok(Response::builder().status(StatusCode::NOT_FOUND).body("N/A".to_string()))
                 }
             }
@@ -131,6 +147,16 @@ async fn discord_user_handler(user_id: String, state: UserStateContainer) -> Res
         Ok(user) => Ok(Response::builder().status(StatusCode::OK).body(user)),
         Err(e) => Ok(Response::builder().status(StatusCode::NOT_FOUND).body(e)),
     }
+}
+
+async fn discord_hash_lookup(user_id_hash: String, state: &UserStateContainer) -> Result<String, String> {
+    //TODO: implement
+    let hash = hex::decode(user_id_hash)
+        .map_err(|e| format!("Unable to decode hex id: {:?}", e))?;
+    let id = state.rainbow_table.get(&hash)
+        .ok_or("Rainbow table did not contain hash".to_string())?;
+    let id = id.to_string();
+    discord_cached_lookup(id, state).await
 }
 
 async fn discord_cached_lookup(user_id: String, state: &UserStateContainer) -> Result<String, String> {
