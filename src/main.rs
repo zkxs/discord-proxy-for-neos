@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
+use std::io::BufReader;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -8,21 +9,20 @@ use std::time::{Duration, Instant};
 use bytes::Buf as _;
 use hyper::{Client, Request};
 use hyper_tls::HttpsConnector;
+use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use tokio::sync::{RwLock, Semaphore};
 use warp::Filter;
 use warp::http::{Response, StatusCode};
 
-use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
-
-use crate::dto::{User, ExtraUserIds, Entry};
-use std::io::BufReader;
+use crate::dto::{Entry, ExtraUserIds, User};
 
 mod dto;
 
 const DISCORD_USER_URI: &str = "https://discord.com/api/v9/users/";
 const NQUERY_URI: &str = "http://127.0.0.1:3029/ExtraUserIds?m=";
 const DEFAULT_CONFIG_FILE_NAME: &str = "discord_token.config";
-const CACHE_EXPIRY_DURATION: Duration = Duration::from_secs(60 * 60); // 1 hour
+/// 1 hour
+const CACHE_EXPIRY_DURATION: Duration = Duration::from_secs(60 * 60);
 const RAINBOW_TABLE: &str = "F:\\git\\discord-gateway-scraper\\snowhash.dat";
 
 type UserStateContainer = Arc<UserState>;
@@ -115,17 +115,16 @@ fn with_state<T: Clone + Send>(db: T) -> impl Filter<Extract=(T, ), Error=std::c
 }
 
 async fn neos_machine_id_handler(machine_id: String, state: UserStateContainer) -> Result<impl warp::Reply, warp::Rejection> {
-
     match extra_user_id_lookup(machine_id).await {
         Ok(extra_user_ids) => {
             match extra_user_ids {
-                ExtraUserIds {discord: Some(discord_id), ..} => {
+                ExtraUserIds { discord: Some(discord_id), .. } => {
                     match discord_cached_lookup(discord_id, &state).await {
                         Ok(user) => Ok(Response::builder().status(StatusCode::OK).body(user)),
                         Err(e) => Ok(Response::builder().status(StatusCode::NOT_FOUND).body(e)),
                     }
                 }
-                ExtraUserIds {discord_hash: Some(discord_hash), ..} => {
+                ExtraUserIds { discord_hash: Some(discord_hash), .. } => {
                     match discord_hash_lookup(discord_hash, &state).await {
                         Ok(user) => Ok(Response::builder().status(StatusCode::OK).body(user)),
                         Err(e) => Ok(Response::builder().status(StatusCode::NOT_FOUND).body(e)),
@@ -177,10 +176,24 @@ async fn discord_cached_lookup(user_id: String, state: &UserStateContainer) -> R
     if let Some(user_string) = cache_result {
         Ok(user_string.user_string.to_owned())
     } else {
+        println!("Acquiring permit...");
+        let start_time = Instant::now();
+
         (*mutable_state_mutex).semaphore.acquire().await.expect("semaphore error").forget();
         drop(mutable_state_mutex);
 
-        discord_lookup(user_id, state).await
+        let elapsed_time = start_time.elapsed();
+        println!("Permit acquire took {}ms", elapsed_time.as_millis());
+
+        println!("Hitting Discord API...");
+        let start_time = Instant::now();
+
+        let result = discord_lookup(user_id, state).await;
+
+        let elapsed_time = start_time.elapsed();
+        println!("Discord API hit took {}ms", elapsed_time.as_millis());
+
+        result
     }
 }
 
@@ -258,11 +271,19 @@ async fn discord_lookup(user_id: String, state: &UserStateContainer) -> Result<S
 
 async fn extra_user_id_lookup(machine_id: String) -> Result<ExtraUserIds, String> {
     let encoded_machine_id = utf8_percent_encode(&machine_id, NON_ALPHANUMERIC).to_string();
+
+    println!("Starting ExtraUserIds request...");
+    let start_time = Instant::now();
+
     let uri = (NQUERY_URI.to_owned() + &encoded_machine_id).parse()
         .map_err(|e| format!("invalid URI: {:?}", e))?;
     let client = Client::new();
     let response = client.get(uri).await
         .map_err(|e| format!("Error hitting ExtraUserIds endpoint: {:?}", e))?;
+
+    let elapsed_time = start_time.elapsed();
+    println!("ExtraUserIds request took {}ms", elapsed_time.as_millis());
+
     deserialize_extra_user_ids(response).await
 }
 
