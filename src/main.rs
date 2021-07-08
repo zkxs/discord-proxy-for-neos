@@ -23,7 +23,7 @@ const NQUERY_URI: &str = "http://127.0.0.1:3029/ExtraUserIds?m=";
 const DEFAULT_CONFIG_FILE_NAME: &str = "discord_token.config";
 /// 1 hour
 const CACHE_EXPIRY_DURATION: Duration = Duration::from_secs(60 * 60);
-const RAINBOW_TABLE: &str = "F:\\git\\discord-gateway-scraper\\snowhash.dat";
+const RAINBOW_TABLE: &str = "F:\\git\\discord-gateway-scraper\\snowhash2.dat";
 
 type UserStateContainer = Arc<UserState>;
 
