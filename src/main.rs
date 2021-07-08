@@ -115,6 +115,7 @@ fn with_state<T: Clone + Send>(db: T) -> impl Filter<Extract=(T, ), Error=std::c
 }
 
 async fn neos_machine_id_handler(machine_id: String, state: UserStateContainer) -> Result<impl warp::Reply, warp::Rejection> {
+    println!("neos_machine_id_handler()");
     match extra_user_id_lookup(machine_id).await {
         Ok(extra_user_ids) => {
             match extra_user_ids {
