@@ -15,9 +15,9 @@ impl User {
 #[derive(Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct ExtraUserIds {
-    // "UniqueDeviceIdentifier" (does not get salted)
+    // "UniqueDeviceIdentifier"
     pub unique_device_identifier: Option<String>,
-    #[serde(rename = "FEF512C2B723BCD6360C3AA26215BC95173FD437FC149C298CE93C4B081E3F28")]
+    #[serde(rename = "2752D89C88F1B3689A6BDA82917570E5F7AB6303D15A4A19F05CE4D31A9506C6")]
     pub unique_device_identifier_hash: Option<String>,
 
     // "Steam"
