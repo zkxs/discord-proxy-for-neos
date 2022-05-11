@@ -54,6 +54,8 @@ async fn main() {
         .map(|entry| (entry.hash, entry.snowflake))
         .collect();
 
+    println!("Loaded {} rainbow table entries", rainbow_table.len());
+
     let proxy_server_address: SocketAddr = ([127, 0, 0, 1], 3032).into();
 
     let discord_bot_token = get_default_config_path()
