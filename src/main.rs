@@ -108,7 +108,7 @@ fn get_default_config_path() -> Result<PathBuf, String> {
         .and_then(|path|
             path.parent()
                 .map(|p| p.to_path_buf().join(DEFAULT_CONFIG_FILE_NAME))
-                .ok_or("Could not find parent directory of this executable".to_string())
+                .ok_or_else(|| "Could not find parent directory of this executable".to_string())
         )
 }
 
@@ -156,7 +156,7 @@ async fn discord_hash_lookup(user_id_hash: String, state: &UserStateContainer) -
     let hash = hex::decode(user_id_hash)
         .map_err(|e| format!("Unable to decode hex id: {:?}", e))?;
     let id = state.rainbow_table.get(&hash)
-        .ok_or("Rainbow table did not contain hash".to_string())?;
+        .ok_or_else(|| "Rainbow table did not contain hash".to_string())?;
     let id = id.to_string();
     discord_cached_lookup(id, state).await
 }
@@ -217,7 +217,7 @@ async fn discord_lookup(user_id: String, state: &UserStateContainer) -> Result<S
 
     match client.request(request).await {
         Ok(response) => {
-            if &response.status() == &StatusCode::OK {
+            if response.status() == StatusCode::OK {
                 let delay = response.headers().get("x-ratelimit-reset-after")
                     .and_then(|d| String::from_utf8(d.as_bytes().into()).ok())
                     .and_then(|d| d.parse().ok())
@@ -255,7 +255,7 @@ async fn discord_lookup(user_id: String, state: &UserStateContainer) -> Result<S
                     restore_permit(&state_clone).await;
                 });
 
-                let status = response.status().clone();
+                let status = response.status();
 
                 match deserialize_string(response).await {
                     Ok(error_body) => Err(error_body),
@@ -266,7 +266,7 @@ async fn discord_lookup(user_id: String, state: &UserStateContainer) -> Result<S
             }
         }
         Err(e) => {
-            restore_permit(&state).await;
+            restore_permit(state).await;
             Err(format!("Error performing request: {:?}", e))
         }
     }
@@ -306,10 +306,10 @@ async fn deserialize_user(response: Response<hyper::Body>) -> Result<User, Strin
 
 async fn deserialize_string(response: Response<hyper::Body>) -> Result<String, String> {
     hyper::body::to_bytes(response).await
-        .map_err(|e| format!("{:?}", e).to_string())
+        .map_err(|e| format!("{:?}", e))
         .and_then(|bytes|
             String::from_utf8(bytes.to_vec())
-                .map_err(|e| format!("{:?}", e).to_string())
+                .map_err(|e| format!("{:?}", e))
         )
 }
 
