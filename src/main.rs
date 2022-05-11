@@ -152,7 +152,6 @@ async fn discord_user_handler(user_id: String, state: UserStateContainer) -> Res
 }
 
 async fn discord_hash_lookup(user_id_hash: String, state: &UserStateContainer) -> Result<String, String> {
-    //TODO: implement
     let hash = hex::decode(user_id_hash)
         .map_err(|e| format!("Unable to decode hex id: {:?}", e))?;
     let id = state.rainbow_table.get(&hash)
