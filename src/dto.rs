@@ -30,9 +30,3 @@ pub struct ExtraUserIds {
     #[serde(rename = "64A8ED529D50BF94F38F81A48284C5B1981752F4E7956529947C93EE470C8DF0")]
     pub discord_hash: Option<String>,
 }
-
-#[derive(Deserialize)]
-pub struct Entry {
-    pub snowflake: u64,
-    pub hash: Vec<u8>,
-}

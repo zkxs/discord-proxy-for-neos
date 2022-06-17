@@ -1,6 +1,7 @@
+use core::convert::TryInto;
 use std::collections::HashMap;
 use std::fs;
-use std::io::BufReader;
+use std::io::{BufReader, Read};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -14,7 +15,7 @@ use tokio::sync::{RwLock, Semaphore};
 use warp::Filter;
 use warp::http::{Response, StatusCode};
 
-use crate::dto::{Entry, ExtraUserIds, User};
+use crate::dto::{ExtraUserIds, User};
 
 mod dto;
 
@@ -23,13 +24,20 @@ const NQUERY_URI: &str = "http://127.0.0.1:3029/ExtraUserIds?m=";
 const DEFAULT_CONFIG_FILE_NAME: &str = "discord_token.config";
 /// 1 hour
 const CACHE_EXPIRY_DURATION: Duration = Duration::from_secs(60 * 60);
-const RAINBOW_TABLE: &str = "F:\\git\\discord-gateway-scraper\\snowhash2.dat";
+const RAINBOW_TABLE: &str = "F:\\git\\discord-gateway-scraper\\snowhash4.dat";
+
+const SNOWFLAKE_SIZE: usize = 8;
+const HASH_SIZE: usize = 32;
+const ROW_SIZE: usize = SNOWFLAKE_SIZE + HASH_SIZE;
+
+type Snowflake = u64;
+type Hash = [u8; HASH_SIZE];
 
 type UserStateContainer = Arc<UserState>;
 
 struct UserState {
     discord_bot_token: String,
-    rainbow_table: HashMap<Vec<u8>, u64>,
+    rainbow_table: HashMap<Hash, Snowflake>,
     mutable_state: RwLock<MutableUserState>,
 }
 
@@ -47,12 +55,7 @@ struct CachedUser {
 async fn main() {
     println!("Initializing {} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
 
-    let rainbow_table_file = fs::File::open(RAINBOW_TABLE).expect("unable to open rainbow table");
-    let rainbow_table_reader = BufReader::new(rainbow_table_file);
-    let rainbow_table_entries: Vec<Entry> = bincode::deserialize_from(rainbow_table_reader).expect("unable to deserialize rainbow table");
-    let rainbow_table: HashMap<Vec<u8>, u64> = rainbow_table_entries.into_iter()
-        .map(|entry| (entry.hash, entry.snowflake))
-        .collect();
+    let rainbow_table = load_rainbow_table();
 
     println!("Loaded {} rainbow table entries", rainbow_table.len());
 
@@ -100,6 +103,28 @@ async fn main() {
     warp::serve(routes)
         .run(proxy_server_address)
         .await;
+}
+
+fn load_rainbow_table() -> HashMap<Hash, Snowflake> {
+    let file = fs::File::open(RAINBOW_TABLE).expect("unable to open rainbow table");
+    let mut buffer: [u8; ROW_SIZE] = [0; ROW_SIZE];
+    let mut reader = BufReader::new(file);
+    let mut rainbow_table: HashMap<Hash, Snowflake> = HashMap::new();
+
+    loop {
+        match reader.read_exact(&mut buffer) {
+            Err(ref e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) => panic!("Can't read from file: {}, err {}", RAINBOW_TABLE, e),
+            Ok(()) => {
+                let snowflake: Snowflake = u64::from_le_bytes(buffer[0..SNOWFLAKE_SIZE].try_into().unwrap());
+                let mut hash: Hash = [0; HASH_SIZE];
+                hash.clone_from_slice(&buffer[SNOWFLAKE_SIZE..ROW_SIZE]);
+                rainbow_table.insert(hash, snowflake);
+            }
+        }
+    }
+
+    rainbow_table
 }
 
 fn get_default_config_path() -> Result<PathBuf, String> {
@@ -152,7 +177,9 @@ async fn discord_user_handler(user_id: String, state: UserStateContainer) -> Res
 }
 
 async fn discord_hash_lookup(user_id_hash: String, state: &UserStateContainer) -> Result<String, String> {
-    let hash = hex::decode(user_id_hash)
+    let hash = base16::decode(user_id_hash.as_bytes())
+        .map_err(|e| format!("Unable to decode hex id: {:?}", e))?;
+    let hash: Hash = hash.try_into()
         .map_err(|e| format!("Unable to decode hex id: {:?}", e))?;
     let id = state.rainbow_table.get(&hash)
         .ok_or_else(|| "Rainbow table did not contain hash".to_string())?;
